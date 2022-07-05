@@ -1,0 +1,7 @@
+/.vscode
+/build
+/build2
+/res/*.csv
+/res/*.bz2
+/eval/*
+!/eval/eval.db
