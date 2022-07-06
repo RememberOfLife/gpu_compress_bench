@@ -36,12 +36,17 @@ constexpr size_t sb_max_elems_c(size_t sb_elem_count)
     return sb_elem_count + (sb_elem_count + 7) / 8;
 }
 
+size_t __device__ __host__ get_compressed_size(size_t uncompressed_data_size, size_t elem_count)
+{
+    return sb_max_elems_c(elem_count) * THREADS_PER_WARP + TABLE_SIZE * sizeof(uint32_t);
+}
+
 __device__ block_stats get_block_stats(size_t uncompressed_data_size, size_t elem_count)
 {
     block_stats b;
     int warp_count = (blockDim.x / THREADS_PER_WARP);
     int warp_idx = (threadIdx.x / THREADS_PER_WARP);
-    b.size_c = sb_max_elems_c(elem_count) * THREADS_PER_WARP + TABLE_SIZE * sizeof(uint32_t);
+    b.size_c = get_compressed_size(uncompressed_data_size, elem_count);
     b.size_d = elem_count * THREADS_PER_WARP * sizeof(uint32_t);
     b.count = (uncompressed_data_size + b.size_d - 1) / b.size_d;
     b.gridstride = gridDim.x * warp_count;
@@ -256,7 +261,7 @@ template <size_t SB_ELEM_COUNT> __device__ void write_out_uncompressed_data(bloc
 }
 
 template <int WARP_COUNT, size_t SB_ELEM_COUNT, uint32_t (*OPERATION)(uint32_t)>
-__global__ void kernel_apply_unary_op_on_compressed(size_t uncompressed_data_size, uint32_t* data)
+__global__ void kernel_apply_unary_op_on_compressed(uint32_t* data, size_t uncompressed_data_size)
 {
     __shared__ uint16_t size_table[THREADS_PER_WARP * WARP_COUNT];
     __shared__ uint32_t s_mem_d[SB_ELEM_COUNT * THREADS_PER_WARP * WARP_COUNT];
@@ -281,8 +286,8 @@ __global__ void kernel_apply_unary_op_on_compressed(size_t uncompressed_data_siz
     }
 }
 
-template <int WARP_COUNT, size_t SB_ELEM_COUNT, uint32_t (*OPERATION)(uint32_t)>
-__global__ void kernel_inital_compress(size_t uncompressed_data_size, uint32_t* initial_data, uint32_t* data_c)
+template <int WARP_COUNT, size_t SB_ELEM_COUNT>
+__global__ void kernel_inital_compress(uint32_t* data_d, uint32_t* data_c, size_t uncompressed_data_size)
 {
     __shared__ uint16_t size_table[THREADS_PER_WARP * WARP_COUNT];
     __shared__ uint32_t s_mem_d[SB_ELEM_COUNT * THREADS_PER_WARP * WARP_COUNT];
@@ -291,7 +296,7 @@ __global__ void kernel_inital_compress(size_t uncompressed_data_size, uint32_t* 
     block_stats b = get_block_stats(uncompressed_data_size, SB_ELEM_COUNT);
 
     for (; b.idx < b.count; b.idx += b.gridstride) {
-        char* initial_data_pos = (char*)data_c + b.idx * b.size_d;
+        char* initial_data_pos = (char*)data_d + b.idx * b.size_d;
         load_in_uncompressed_data<SB_ELEM_COUNT>((uint32_t*)initial_data_pos, s_mem_d);
 
         size_t sb_size = compress_sub_blocks<SB_ELEM_COUNT>(s_mem_d, size_table, s_mem_c);
@@ -302,8 +307,8 @@ __global__ void kernel_inital_compress(size_t uncompressed_data_size, uint32_t* 
     }
 }
 
-template <int WARP_COUNT, size_t SB_ELEM_COUNT, uint32_t (*OPERATION)(uint32_t)>
-__global__ void kernel_final_decompress(size_t uncompressed_data_size, uint32_t* data_c, uint32_t* data_d)
+template <int WARP_COUNT, size_t SB_ELEM_COUNT>
+__global__ void kernel_final_decompress(uint32_t* data_c, uint32_t* data_d, size_t uncompressed_data_size)
 {
     __shared__ uint16_t size_table[THREADS_PER_WARP * WARP_COUNT];
     __shared__ uint32_t s_mem_d[SB_ELEM_COUNT * THREADS_PER_WARP * WARP_COUNT];
@@ -313,12 +318,12 @@ __global__ void kernel_final_decompress(size_t uncompressed_data_size, uint32_t*
 
     for (; b.idx < b.count; b.idx += b.gridstride) {
         char* table_position = (char*)data_c + b.idx * b.size_c;
-        load_in_compressed_data<SB_ELEM_COUNT>(table_position, size_table, &s_mem_c);
+        load_in_compressed_data<SB_ELEM_COUNT>(table_position, size_table, s_mem_c);
 
-        decompress_sub_blocks<SB_ELEM_COUNT>(&s_mem_c, &s_mem_d);
+        decompress_sub_blocks<SB_ELEM_COUNT>(s_mem_c, size_table, s_mem_d);
 
         char* data_d_pos = (char*)data_d + b.idx * b.size_d;
-        write_out_uncompressed_data<SB_ELEM_COUNT>(&s_mem_d, size_table, table_position);
+        write_out_uncompressed_data<SB_ELEM_COUNT>(&b, s_mem_d, (uint32_t*)data_d_pos);
     }
 }
 
@@ -327,7 +332,7 @@ uint32_t inc(uint32_t x)
     return x + 1;
 }
 
-int main()
+int main_foo()
 {
     const size_t elements = 1 << 20;
     size_t data_size = elements * sizeof(uint32_t);
@@ -357,6 +362,30 @@ int main()
     free(out);
     free(res);
     return 0;
+}
 
-    kernel_inital_compress<1, 4, &inc><<<1, 1>>>(1, NULL, NULL);
+int main()
+{
+    constexpr size_t elem_count = 1024;
+    size_t data_size = elem_count * sizeof(uint32_t);
+    size_t data_size_compressed = get_compressed_size(data_size, elem_count);
+
+    uint32_t* data_d = (uint32_t*)malloc(data_size);
+    uint32_t* data_dest = (uint32_t*)malloc(data_size);
+
+    uint32_t* data_c_gpu;
+    uint32_t* data_d_gpu;
+    CUDA_TRY(cudaMalloc(&data_c_gpu, data_size_compressed));
+    CUDA_TRY(cudaMalloc(&data_d_gpu, data_size));
+
+    for (int i = 0; i < elem_count; i++) {
+        data_d[i] = 17;
+    }
+
+    CUDA_TRY(cudaMemcpy(data_d_gpu, data_d, data_size, cudaMemcpyHostToDevice));
+
+    kernel_inital_compress<1, 4><<<1, 1>>>(data_c_gpu, data_d_gpu, data_size);
+    kernel_final_decompress<1, 4><<<1, 1>>>(data_d_gpu, data_c_gpu, data_size);
+
+    CUDA_TRY(cudaMemcpy(data_dest, data_d_gpu, data_size, cudaMemcpyDeviceToHost));
 }
