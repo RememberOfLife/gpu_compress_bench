@@ -79,11 +79,19 @@ template <typename T> __host__ __device__ bool decode_sign(T* val)
     return negative;
 }
 
-// TODO encode using unsigned overflows if going from very very large to very very small, this can save some more space
+#define SDIFF_VMAX (UINT32_MAX & 0b01111111111111111111111111111111)
 //  value v2 succeeds v1, get the diff encoded with lsb sign
 //  use this to encode val, given the base
 template <typename T> __host__ __device__ T encoded_sign_diff(T base, T val)
 {
+    // encode using unsigned overflows if going from very large to very small (or other way), benefits for a few cases
+    if (SDIFF_VMAX - base + val <= (val > base ? val - base : base - val)) {
+        return encode_sign(SDIFF_VMAX - base + val + 1, false);
+    }
+    if (SDIFF_VMAX - val + base <= (val > base ? val - base : base - val)) {
+        return encode_sign(SDIFF_VMAX - val + base + 1, true);
+    }
+    // normal encoding
     if (val > base) {
         return encode_sign(val - base, false);
     }
@@ -99,6 +107,8 @@ template <typename T> T __host__ __device__ decode_sign_diff(T base, T signdiff)
     }
     return base + signdiff;
 }
+
+// TODO remove byte splicing from compression
 
 template <size_t SB_ELEM_COUNT, bool USE_DIFFERENTIAL_PRE_ENCODING> __host__ __device__ size_t compress_block(uint32_t* data_d, uint8_t* data_c)
 {
@@ -198,6 +208,7 @@ __host__ __device__ void decompress_block(size_t data_size, uint8_t* data_c, uin
                 }
                 else {
                     dbase = decode_sign_diff(dbase, out_el);
+                    dbase &= 0b01111111111111111111111111111111;
                 }
                 data_d[out_idx++] = dbase;
             }
@@ -396,7 +407,7 @@ uint32_t inc(uint32_t x)
 
 int main_foo()
 {
-    const size_t elements = 1 << 20;
+    const size_t elements = /*1 << */ 20;
     size_t data_size = elements * sizeof(uint32_t);
     size_t worst_size = data_size + data_size / 8;
     uint32_t* in = (uint32_t*)malloc(data_size);
@@ -407,10 +418,23 @@ int main_foo()
         uint32_t a = rng.rand();
         uint32_t b = rng.rand();
         uint32_t c = rng.rand();
-        // in[i] = a % ((b >> (32 - (c & 0b11111))) + 1);
         // TODO use some proper dataset to show all pros/cons of both algos
-        in[i] = i == 0 ? a : in[i - 1] + (a % 200);
-        in[i] &= 0b011111111111111111111111111111; // safety check for diff pre enc
+
+        // use this to show off normal ZS
+        // in[i] = a % ((b >> (32 - (c & 0b11111))) + 1);
+
+        // use this to show off basic diff enc
+        // in[i] = i == 0 ? a : in[i - 1] + (a % 200);
+
+        // use this to show off specifically the overflow diff enc
+        if (i % 2 == 0) {
+            in[i] = a | 0b01111111111111111111111110000000;
+        }
+        else {
+            in[i] = a & 0b1111111;
+        }
+
+        in[i] &= 0b01111111111111111111111111111111; // sanitize for diff pre enc
     }
     // normal zero suppression
     size_t compressed_size = compress_block<elements, false>(in, out);
