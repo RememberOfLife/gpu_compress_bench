@@ -66,18 +66,68 @@ template <typename T> void bit_print(T data, bool spacing = true)
     }
 }
 
-// TODO integrate with compress_sub_blocks
-template <size_t SB_ELEM_COUNT> __host__ __device__ size_t compress_block(uint32_t* data_d, uint8_t* data_c)
+template <typename T> __host__ __device__ T encode_sign(T val, bool negative)
+{
+    return (val << 1) | (negative ? 0b1 : 0b0);
+}
+
+// returns the sign, AND shifts out the seign bit from the val
+template <typename T> __host__ __device__ bool decode_sign(T* val)
+{
+    bool negative = (*val & 0b1);
+    *val >>= 1;
+    return negative;
+}
+
+// TODO encode using unsigned overflows if going from very very large to very very small, this can save some more space
+//  value v2 succeeds v1, get the diff encoded with lsb sign
+//  use this to encode val, given the base
+template <typename T> __host__ __device__ T encoded_sign_diff(T base, T val)
+{
+    if (val > base) {
+        return encode_sign(val - base, false);
+    }
+    return encode_sign(base - val, true);
+}
+
+// use this to decode the value underlying signdiff, given the base
+template <typename T> T __host__ __device__ decode_sign_diff(T base, T signdiff)
+{
+    bool negative_diff = decode_sign(&signdiff);
+    if (negative_diff) {
+        return base - signdiff;
+    }
+    return base + signdiff;
+}
+
+template <size_t SB_ELEM_COUNT, bool USE_DIFFERENTIAL_PRE_ENCODING> __host__ __device__ size_t compress_block(uint32_t* data_d, uint8_t* data_c)
 {
     size_t in_count = SB_ELEM_COUNT;
     size_t in_idx = 0;
     size_t out_byte_idx = 0;
     while (in_idx < in_count) {
         uint64_t working = 0;
+        uint64_t inel2[2];
+        if (USE_DIFFERENTIAL_PRE_ENCODING) {
+            // currently this can only handle elements that are not using the most significant bit
+            assert(data_d[in_idx] <= UINT32_MAX / 2);
+            assert(data_d[in_idx + 1] <= UINT32_MAX / 2);
+            if (in_idx == 0) {
+                inel2[0] = data_d[0];
+            }
+            else {
+                inel2[0] = encoded_sign_diff(data_d[in_idx - 1], data_d[in_idx]);
+            }
+            inel2[1] = encoded_sign_diff(data_d[in_idx], data_d[in_idx + 1]);
+        }
+        else {
+            inel2[0] = data_d[in_idx];
+            inel2[1] = data_d[in_idx + 1];
+        }
         for (int i = 0; i < 2; i++) {
             for (int j = 0; j < 4; j++) {
                 // splice both u32 together bytewise
-                working |= (((uint64_t)data_d[in_idx] >> (j * 8)) & 0xFF) << ((j * 16) + (i * 8));
+                working |= ((inel2[i] >> (j * 8)) & 0xFF) << ((j * 16) + (i * 8));
             }
             in_idx++;
         }
@@ -108,11 +158,12 @@ template <size_t SB_ELEM_COUNT> __host__ __device__ size_t compress_block(uint32
     return out_byte_idx;
 }
 
-// TODO integrate with decompress_sub_blocks
-template <size_t SB_ELEM_COUNT> __host__ __device__ void decompress_block(size_t data_size, uint8_t* data_c, uint32_t* data_d)
+template <size_t SB_ELEM_COUNT, bool USE_DIFFERENTIAL_PRE_ENCODING>
+__host__ __device__ void decompress_block(size_t data_size, uint8_t* data_c, uint32_t* data_d)
 {
     size_t in_byte_idx = 0;
     size_t out_idx = 0;
+    uint32_t dbase;
     while (in_byte_idx < data_size) {
         uint64_t acc = 0;
         // accumulate bytes until one is marked as uncontinued
@@ -141,7 +192,18 @@ template <size_t SB_ELEM_COUNT> __host__ __device__ void decompress_block(size_t
                 // unsplice into two u32 elements
                 out_el |= ((acc >> ((j * 16) + (i * 8))) & 0xFF) << (j * 8);
             }
-            data_d[out_idx++] = out_el;
+            if (USE_DIFFERENTIAL_PRE_ENCODING) {
+                if (out_idx == 0) {
+                    dbase = out_el;
+                }
+                else {
+                    dbase = decode_sign_diff(dbase, out_el);
+                }
+                data_d[out_idx++] = dbase;
+            }
+            else {
+                data_d[out_idx++] = out_el;
+            }
         }
     }
 }
@@ -151,14 +213,14 @@ template <size_t SB_ELEM_COUNT> __device__ void decompress_sub_blocks(uint32_t* 
     uint8_t* begin_c = (uint8_t*)&data_c[threadIdx.x * sb_max_elems_c(SB_ELEM_COUNT)];
     uint8_t* end_c = ((uint8_t*)data_c) + size_table[threadIdx.x];
     uint32_t* begin_d = &data_d[threadIdx.x * sb_max_elems_c(SB_ELEM_COUNT)];
-    decompress_block<SB_ELEM_COUNT>(end_c - begin_c, begin_c, begin_d);
+    decompress_block<SB_ELEM_COUNT, true>(end_c - begin_c, begin_c, begin_d);
 }
 
 template <size_t SB_ELEM_COUNT> __device__ size_t compress_sub_blocks(uint32_t* data_d, uint16_t* size_table, uint32_t* data_c)
 {
     uint8_t* begin_c = (uint8_t*)&data_c[threadIdx.x * SB_ELEM_COUNT];
     uint32_t* begin_d = &data_d[threadIdx.x * sb_max_elems_c(SB_ELEM_COUNT)];
-    return compress_block<SB_ELEM_COUNT>(begin_d, begin_c);
+    return compress_block<SB_ELEM_COUNT, true>(begin_d, begin_c);
 }
 
 template <size_t SB_ELEM_COUNT> __device__ void build_size_table(uint16_t* size_table, uint16_t my_sb_size)
@@ -345,19 +407,35 @@ int main_foo()
         uint32_t a = rng.rand();
         uint32_t b = rng.rand();
         uint32_t c = rng.rand();
-        in[i] = a % ((b >> (31 - (c & 0b11111))) + 1);
+        // in[i] = a % ((b >> (32 - (c & 0b11111))) + 1);
+        // TODO use some proper dataset to show all pros/cons of both algos
+        in[i] = i == 0 ? a : in[i - 1] + (a % 200);
+        in[i] &= 0b011111111111111111111111111111; // safety check for diff pre enc
     }
-    size_t compressed_size = compress_block<elements>(in, out);
-    printf("compressed %zu data bytes into %zu / %zu\n", data_size, compressed_size, worst_size);
-    printf("ratio: %.3f\n", (float)data_size / (float)compressed_size);
-    decompress_block<elements>(compressed_size, out, res);
+    // normal zero suppression
+    size_t compressed_size = compress_block<elements, false>(in, out);
+    printf("ZS compressed %zu data bytes into %zu / %zu\n", data_size, compressed_size, worst_size);
+    printf("ZS ratio ZS: %.3f\n", (float)data_size / (float)compressed_size);
+    decompress_block<elements, false>(compressed_size, out, res);
     for (size_t i = 0; i < elements; i++) {
         if (in[i] != res[i]) {
-            printf("FAIL @ %zu : I %u != O %u\n", i, in[i], res[i]);
+            printf("ZS FAIL @ %zu : I %u != O %u\n", i, in[i], res[i]);
             exit(1);
         }
     }
-    printf("PASS %zu\n", elements);
+    printf("ZS PASS %zu\n", elements);
+    // differential pre encoding into zero suppression
+    compressed_size = compress_block<elements, true>(in, out);
+    printf("DE-ZS compressed %zu data bytes into %zu / %zu\n", data_size, compressed_size, worst_size);
+    printf("DE-ZS ratio: %.3f\n", (float)data_size / (float)compressed_size);
+    decompress_block<elements, true>(compressed_size, out, res);
+    for (size_t i = 0; i < elements; i++) {
+        if (in[i] != res[i]) {
+            printf("DE-ZS FAIL @ %zu : I %u != O %u\n", i, in[i], res[i]);
+            exit(1);
+        }
+    }
+    printf("DE-ZS PASS %zu\n", elements);
     free(in);
     free(out);
     free(res);
@@ -366,6 +444,9 @@ int main_foo()
 
 int main()
 {
+    main_foo();
+    exit(0);
+
     constexpr size_t elem_count = 1024;
     size_t data_size = elem_count * sizeof(uint32_t);
     size_t data_size_compressed = get_compressed_size(data_size, elem_count);
