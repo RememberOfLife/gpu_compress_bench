@@ -2,6 +2,7 @@
 #include "cuda_time.cuh"
 #include <cstdint>
 #include <cstddef>
+#include "fast_prng.cuh"
 
 #define THREADS_PER_WARP 32
 
@@ -19,6 +20,59 @@
 
         */
 
+template <typename T> void bit_print(T data, bool spacing = true)
+{
+    size_t typewidth_m1 = sizeof(T) * 8 - 1;
+    for (int i = typewidth_m1; i >= 0; i--) {
+        printf("%c", (data >> i) & 0b1 ? '1' : '0');
+        if (spacing && i < typewidth_m1 && i > 0 && i % 8 == 0) {
+            printf(" ");
+        }
+    }
+}
+
+// TODO integrate with compress_sub_blocks
+template <size_t ELEMENT_COUNT> __host__ __device__ size_t compress_block(uint32_t* data_d, uint8_t* data_c)
+{
+    size_t in_count = ELEMENT_COUNT;
+    size_t in_idx = 0;
+    size_t out_byte_idx = 0;
+    while (in_idx < in_count) {
+        uint64_t working = 0;
+        for (int i = 0; i < 2; i++) {
+            for (int j = 0; j < 4; j++) {
+                // splice both u32 together bytewise
+                working |= (((uint64_t)data_d[in_idx] >> (j * 8)) & 0xFF) << ((j * 16) + (i * 8));
+            }
+            in_idx++;
+        }
+        // printf("WC:");
+        // bit_print(working);
+        // printf("\n");
+        for (int i = 0; i < 9; i++) {
+            // get rightmost 7 bits of working, mark as continued if working is non zero
+            uint8_t acc;
+            if (i == 8) {
+                // if we need all 8 bytes, dont encode the continuation bit in the last one
+                acc = (working & 0b11111111);
+                working >>= 8;
+            }
+            else {
+                acc = (working & 0b01111111);
+                working >>= 7;
+            }
+            if (working) {
+                acc |= 0b10000000;
+            }
+            data_c[out_byte_idx++] = acc;
+            if (!working) {
+                break;
+            }
+        }
+    }
+    return out_byte_idx;
+}
+
 template <size_t ELEMENT_COUNT, size_t WORST_SIZE> __device__ size_t compress_sub_blocks(uint32_t* data_d, uint16_t* size_table, uint32_t* data_c)
 {
     uint32_t* begin = &data_c[threadIdx.x * WORST_SIZE];
@@ -28,6 +82,44 @@ template <size_t ELEMENT_COUNT, size_t WORST_SIZE> __device__ size_t compress_su
         data_c[pos_c++] = data_d[i];
     }
     return sizeof(uint32_t) * pos_c;
+}
+
+// TODO integrate with decompress_sub_blocks
+template <size_t ELEMENT_COUNT> __host__ __device__ void decompress_block(size_t data_size, uint8_t* data_c, uint32_t* data_d)
+{
+    size_t in_byte_idx = 0;
+    size_t out_idx = 0;
+    while (in_byte_idx < data_size) {
+        uint64_t acc = 0;
+        // accumulate bytes until one is marked as uncontinued
+        uint8_t shift = 0;
+        while (true) {
+            assert(shift < 9);
+            uint64_t working;
+            if (shift == 8) {
+                working = data_c[in_byte_idx++];
+                acc |= (working << (shift++ * 7));
+            }
+            else {
+                working = data_c[in_byte_idx++];
+                acc |= ((working & 0b01111111) << (shift++ * 7));
+            }
+            if (!(working & 0b10000000) || shift == 9) {
+                break;
+            }
+        }
+        // printf("WD:");
+        // bit_print(acc);
+        // printf("\n");
+        for (int i = 0; i < 2; i++) {
+            uint32_t out_el = 0;
+            for (int j = 0; j < 4; j++) {
+                // unsplice into two u32 elements
+                out_el |= ((acc >> ((j * 16) + (i * 8))) & 0xFF) << (j * 8);
+            }
+            data_d[out_idx++] = out_el;
+        }
+    }
 }
 
 template <size_t ELEMENT_COUNT, size_t WORST_SIZE> __device__ void decompress_sub_blocks(uint8_t* data_c, uint16_t* size_table, uint32_t* data_d)
@@ -211,5 +303,34 @@ uint32_t inc(uint32_t x)
 
 int main()
 {
+    const size_t elements = 1 << 20;
+    size_t data_size = elements * sizeof(uint32_t);
+    size_t worst_size = data_size + data_size / 8;
+    uint32_t* in = (uint32_t*)malloc(data_size);
+    uint32_t* res = (uint32_t*)malloc(data_size);
+    uint8_t* out = (uint8_t*)malloc(worst_size);
+    fast_prng rng(42);
+    for (size_t i = 0; i < elements; i++) {
+        uint32_t a = rng.rand();
+        uint32_t b = rng.rand();
+        uint32_t c = rng.rand();
+        in[i] = a % ((b >> (31 - (c & 0b11111))) + 1);
+    }
+    size_t compressed_size = compress_block<elements>(in, out);
+    printf("compressed %zu data bytes into %zu / %zu\n", data_size, compressed_size, worst_size);
+    printf("ratio: %.3f\n", (float)data_size / (float)compressed_size);
+    decompress_block<elements>(compressed_size, out, res);
+    for (size_t i = 0; i < elements; i++) {
+        if (in[i] != res[i]) {
+            printf("FAIL @ %zu : I %u != O %u\n", i, in[i], res[i]);
+            exit(1);
+        }
+    }
+    printf("PASS %zu\n", elements);
+    free(in);
+    free(out);
+    free(res);
+    return 0;
+
     kernel_inital_compress<1, 4, 16, &inc><<<1, 1>>>(1, NULL, NULL);
 }
