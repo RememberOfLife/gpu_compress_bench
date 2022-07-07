@@ -242,6 +242,10 @@ template <size_t SB_ELEM_COUNT> __device__ size_t compress_block_nop(uint32_t* d
 template <size_t SB_ELEM_COUNT> __device__ void decompress_sub_blocks(uint32_t* data_c, uint16_t* size_table, uint32_t* data_d)
 {
     int warp_offset = get_warp_offset();
+    for (int i = 0; i < SB_ELEM_COUNT; i++) {
+        data_d[warp_offset + i * SB_ELEM_COUNT] = ((uint32_t*)data_c)[warp_offset + i * sb_max_elems_c(SB_ELEM_COUNT)];
+    }
+    return;
     uint32_t* begin_d = &data_d[warp_offset * SB_ELEM_COUNT];
     uint8_t* begin_c = (uint8_t*)&data_c[warp_offset * sb_max_elems_c(SB_ELEM_COUNT)];
     size_t prev_size = warp_offset == 0 ? 0 : ceil_size_to_elements(size_table[warp_offset - 1]);
@@ -253,6 +257,10 @@ template <size_t SB_ELEM_COUNT> __device__ void decompress_sub_blocks(uint32_t* 
 template <size_t SB_ELEM_COUNT> __device__ size_t compress_sub_blocks(uint32_t* data_d, uint16_t* size_table, uint32_t* data_c)
 {
     int warp_offset = get_warp_offset();
+    for (int i = 0; i < SB_ELEM_COUNT; i++) {
+        ((uint32_t*)data_c)[warp_offset + i * sb_max_elems_c(SB_ELEM_COUNT)] = data_d[warp_offset + i * SB_ELEM_COUNT];
+    }
+    return SB_ELEM_COUNT * sizeof(uint32_t);
     uint32_t* begin_d = &data_d[warp_offset * SB_ELEM_COUNT];
     uint8_t* begin_c = (uint8_t*)&data_c[warp_offset * sb_max_elems_c(SB_ELEM_COUNT)];
     return compress_block_nop<SB_ELEM_COUNT>(begin_d, begin_c);
@@ -319,7 +327,7 @@ template <size_t SB_ELEM_COUNT> __device__ void write_out_compressed_data(uint32
         }
         if (subblock_idx == THREADS_PER_WARP) break;
         size_t sb_offset = data_offset - (subblock_idx ? size_table[subblock_idx - 1] : 0);
-        size_t data_c_idx = subblock_idx * sb_max_elems_c(SB_ELEM_COUNT) + sb_offset / sizeof(uint32_t);
+        size_t data_c_idx = subblock_idx + (sb_offset / sizeof(uint32_t)) * sb_max_elems_c(SB_ELEM_COUNT);
         data_tgt[warp_offset + i * THREADS_PER_WARP] = data_c[data_c_idx];
         data_offset += THREADS_PER_WARP * sizeof(uint32_t);
     }
@@ -347,7 +355,7 @@ template <size_t SB_ELEM_COUNT> __device__ void load_in_compressed_data(char* ta
         }
         if (subblock_idx == THREADS_PER_WARP) break;
         size_t sb_offset = data_offset - (subblock_idx ? size_table[subblock_idx - 1] : 0);
-        size_t data_c_idx = subblock_idx * sb_max_elems_c(SB_ELEM_COUNT) + sb_offset / sizeof(uint32_t);
+        size_t data_c_idx = subblock_idx + (sb_offset / sizeof(uint32_t)) * sb_max_elems_c(SB_ELEM_COUNT);
         data_c[data_c_idx] = data_src[warp_offset + i * THREADS_PER_WARP];
         data_offset += THREADS_PER_WARP * sizeof(uint32_t);
     }
@@ -359,7 +367,7 @@ template <size_t SB_ELEM_COUNT> __device__ void load_in_uncompressed_data(uint32
 {
     int warp_offset = get_warp_offset();
     for (int i = warp_offset; i < SB_ELEM_COUNT * THREADS_PER_WARP; i += THREADS_PER_WARP) {
-        data_d[i] = data_src[i];
+        data_d[(i / SB_ELEM_COUNT) + (i % SB_ELEM_COUNT) * SB_ELEM_COUNT] = data_src[i];
     }
 }
 
@@ -372,7 +380,7 @@ template <size_t SB_ELEM_COUNT> __device__ void write_out_uncompressed_data(bloc
     }
 
     for (int i = warp_offset; i < elem_count; i += THREADS_PER_WARP) {
-        data_tgt[i] = data_d[i];
+        data_tgt[i] = data_d[(i / SB_ELEM_COUNT) + (i % SB_ELEM_COUNT) * SB_ELEM_COUNT];
     }
 }
 
