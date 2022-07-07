@@ -39,3 +39,18 @@
 #endif
 
 #endif
+
+#define CUDA_QUICKTIME(time, ...)                                                                                                                    \
+    do {                                                                                                                                             \
+        cudaEvent_t start, stop;                                                                                                                     \
+        cudaEventCreate(&start);                                                                                                                     \
+        cudaEventCreate(&stop);                                                                                                                      \
+        CUDA_TRY(cudaStreamSynchronize(0));                                                                                                          \
+        CUDA_TRY(cudaEventRecord(start));                                                                                                            \
+        {                                                                                                                                            \
+            __VA_ARGS__;                                                                                                                             \
+        }                                                                                                                                            \
+        CUDA_TRY(cudaEventRecord(stop));                                                                                                             \
+        CUDA_TRY(cudaEventSynchronize(stop));                                                                                                        \
+        CUDA_TRY(cudaEventElapsedTime(time, start, stop));                                                                                           \
+    } while (0)
